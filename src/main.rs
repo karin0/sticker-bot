@@ -117,30 +117,30 @@ async fn process_video(file: &Path) -> AnyResult<(Bytes, &'static str)> {
     }
 }
 
-async fn handle_image(f: TgFile, bot: &AutoSend<Bot>) -> AnyResult<(Bytes, &'static str)> {
-    let mut v = Vec::with_capacity(f.file_size as usize);
-    bot.download_file(&f.file_path, &mut v).await?;
+async fn handle_image(f: TgFile, bot: &Bot) -> AnyResult<(Bytes, &'static str)> {
+    let mut v = Vec::with_capacity(f.size as usize);
+    bot.download_file(&f.path, &mut v).await?;
     info!("downloaded {} bytes", v.len());
     process_image(v).await
 }
 
-async fn handle_video(f: TgFile, bot: &AutoSend<Bot>) -> AnyResult<(Bytes, &'static str)> {
+async fn handle_video(f: TgFile, bot: &Bot) -> AnyResult<(Bytes, &'static str)> {
     let path = NamedTempFile::new()?.into_temp_path();
     let mut tmp = File::create(&path).await?;
-    bot.download_file(&f.file_path, &mut tmp).await?;
+    bot.download_file(&f.path, &mut tmp).await?;
     tmp.flush().await?;
     drop(tmp);
-    info!("downloaded {} bytes", f.file_size);
+    info!("downloaded {} bytes", f.size);
     process_video(&path).await
 }
 
 async fn handle_media(
     file_id: &String,
-    bot: &AutoSend<Bot>,
+    bot: &Bot,
     is_video: bool,
 ) -> AnyResult<(Bytes, &'static str)> {
     let f = bot.get_file(file_id).await?;
-    if f.file_size > MAX_SIZE {
+    if f.size > MAX_SIZE {
         bail!("File too big")
     }
     if is_video {
@@ -150,7 +150,7 @@ async fn handle_media(
     }
 }
 
-async fn handler(msg: Message, bot: &AutoSend<Bot>) -> &'static str {
+async fn handler(msg: Message, bot: &Bot) -> &'static str {
     let ch = &msg.chat;
     info!(
         "from {} {} (@{} {})",
@@ -164,12 +164,12 @@ async fn handler(msg: Message, bot: &AutoSend<Bot>) -> &'static str {
         info!(
             "downloading document {} of {} bytes",
             doc.file_name.as_deref().unwrap_or(""),
-            doc.file_size
+            doc.file.size
         );
         if let Some(s) = &doc.file_name {
             is_video = s.ends_with(".gif");
         }
-        (&doc.file_id, doc.file_size, &doc.file_name)
+        (&doc.file.id, doc.file.size, &doc.file_name)
     } else if let Some(sizes) = msg.photo() {
         let ph = sizes
             .iter()
@@ -177,9 +177,9 @@ async fn handler(msg: Message, bot: &AutoSend<Bot>) -> &'static str {
             .unwrap_or_else(|| sizes.last().unwrap());
         info!(
             "downloading photo of {} {}, {} bytes",
-            ph.width, ph.height, ph.file_size
+            ph.width, ph.height, ph.file.size
         );
-        (&ph.file_id, ph.file_size, &None)
+        (&ph.file.id, ph.file.size, &None)
     } else if let Some(ani) = msg.animation() {
         info!(
             "downloading animation {} of {}, {}, {}, {} bytes",
@@ -187,10 +187,10 @@ async fn handler(msg: Message, bot: &AutoSend<Bot>) -> &'static str {
             ani.width,
             ani.height,
             ani.duration,
-            ani.file_size
+            ani.file.size
         );
         is_video = true;
-        (&ani.file_id, ani.file_size, &ani.file_name)
+        (&ani.file.id, ani.file.size, &ani.file_name)
     } else if Some("/start") == msg.text() {
         return "Hi! Send me an image or a GIF animation, and I'll convert it for use with @Stickers.";
     } else {
@@ -242,10 +242,10 @@ async fn main() {
     pretty_env_logger::init();
     info!("starting bot...");
 
-    let bot = Bot::from_env().auto_send();
-    info!("bot started by {:?}", bot.inner().client());
+    let bot = Bot::from_env();
+    info!("bot started by {:?}", bot.client());
 
-    teloxide::repl(bot, |msg: Message, bot: AutoSend<Bot>| async move {
+    teloxide::repl(bot, |msg: Message, bot: Bot| async move {
         tokio::spawn(async move {
             let id = msg.chat.id;
             let s = handler(msg, &bot).await;

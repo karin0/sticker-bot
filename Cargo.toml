@@ -1,5 +1,5 @@
 [package]
-name = "tg-sticker-helper-bot"
+name = "sticker-bot"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,12 +8,12 @@ strip = true
 lto = true
 
 [dependencies]
-teloxide = { version = "0.10", features = ["macros", "auto-send"] }
-log = "0.4"
-pretty_env_logger = "0.4"
-tokio = { version =  "1.20", features = ["rt-multi-thread", "macros", "process"] }
-image = "0.24"
+teloxide = { version = "0", features = ["rustls"] }
+log = "0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
+image = "0"
 anyhow = "1"
-webp = "0.2"
+webp = "0"
 bytes = "1"
 tempfile = "3"
+pretty_env_logger = { git = "https://github.com/karin0/pretty-env-logger.git" }
