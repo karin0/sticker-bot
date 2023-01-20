@@ -4,16 +4,16 @@ use image::imageops::FilterType;
 use image::io::Reader as ImageReader;
 use image::{GenericImageView, ImageOutputFormat};
 use log::{error, info, warn};
-use std::fmt::Display;
 use std::io::Cursor;
 use std::path::Path;
 use std::process::Stdio;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{File as TgFile, InputFile};
+use teloxide::types::{File as TgFile, InputFile, StickerFormat};
 use tempfile::NamedTempFile;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use tokio::join;
 use tokio::process::Command;
 use webp::Encoder as WebpEncoder;
 
@@ -36,23 +36,6 @@ const FFMPEG_ARGS: (&[&str], &[&str]) = (
     ],
 );
 
-#[derive(Debug)]
-struct BadRequest {
-    msg: &'static str,
-}
-
-impl Display for BadRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.msg)
-    }
-}
-
-impl BadRequest {
-    fn new(msg: &'static str) -> Self {
-        Self { msg }
-    }
-}
-
 async fn process_image(file: Vec<u8>) -> AnyResult<(Bytes, &'static str)> {
     match ImageReader::new(Cursor::new(file))
         .with_guessed_format()
@@ -66,7 +49,7 @@ async fn process_image(file: Vec<u8>) -> AnyResult<(Bytes, &'static str)> {
             return Ok(match WebpEncoder::from_image(&img) {
                 Ok(webp) => {
                     let mem = webp.encode_lossless();
-                    (Bytes::copy_from_slice(&*mem), "webp")
+                    (Bytes::copy_from_slice(&mem), "webp")
                 }
                 Err(e) => {
                     warn!("webp: {}, falling back to png", e);
@@ -78,7 +61,7 @@ async fn process_image(file: Vec<u8>) -> AnyResult<(Bytes, &'static str)> {
         }
         Err(e) => {
             info!("decode failed: {}", e);
-            bail!(BadRequest::new("File is not an image!"))
+            bail!("File is not an image.")
         }
     }
 }
@@ -134,20 +117,113 @@ async fn handle_video(f: TgFile, bot: &Bot) -> AnyResult<(Bytes, &'static str)> 
     process_video(&path).await
 }
 
+#[derive(Debug, Clone)]
+enum Op {
+    Image,
+    Video,
+    Sticker(StickerFormat),
+}
+
+#[derive(Copy, Debug, Clone)]
+enum Action {
+    Raw,
+    Photo,
+}
+
 async fn handle_media(
     file_id: &String,
     bot: &Bot,
-    is_video: bool,
-) -> AnyResult<(Bytes, &'static str)> {
+    op: Op,
+) -> AnyResult<(Bytes, &'static str, Action)> {
     let f = bot.get_file(file_id).await?;
     if f.size > MAX_SIZE {
         bail!("File too big")
     }
-    if is_video {
-        handle_video(f, bot).await
-    } else {
-        handle_image(f, bot).await
+    match op {
+        Op::Image => handle_image(f, bot).await.map(|(a, b)| (a, b, Action::Raw)),
+        Op::Video => handle_video(f, bot).await.map(|(a, b)| (a, b, Action::Raw)),
+        Op::Sticker(fmt) => {
+            let mut v = Vec::with_capacity(f.size as usize);
+            bot.download_file(&f.path, &mut v).await?;
+            info!("downloaded {} bytes", v.len());
+            let mut action = Action::Raw;
+            let suffix = match fmt {
+                // Name the webp file as png to avoid sending the sticker again.
+                StickerFormat::Raster => {
+                    action = Action::Photo;
+                    "png"
+                }
+                StickerFormat::Video => "webm",
+                // TODO: Convert tgs to a portable format
+                StickerFormat::Animated => "tgs",
+            };
+            Ok((Bytes::from(v), suffix, action))
+        }
     }
+}
+
+async fn reply_photo(
+    msg: &Message,
+    bot: &Bot,
+    f: InputFile,
+    caption: Option<&str>,
+) -> AnyResult<()> {
+    let mut p = bot.send_photo(msg.chat.id, f);
+    if let Some(s) = caption {
+        p.caption = Some(s.to_string());
+    }
+    p.reply_to_message_id = Some(msg.id);
+    if let Err(e) = p.await {
+        error!("send_photo: {}", e);
+        bail!("Failed to send photo.")
+    } else {
+        Ok(())
+    }
+}
+
+async fn reply_document(
+    msg: &Message,
+    bot: &Bot,
+    f: InputFile,
+    caption: Option<&str>,
+) -> AnyResult<()> {
+    let mut p = bot.send_document(msg.chat.id, f);
+    if let Some(s) = caption {
+        p.caption = Some(s.to_string());
+    }
+    p.reply_to_message_id = Some(msg.id);
+    if let Err(e) = p.await {
+        error!("send_document: {}", e);
+        bail!("Failed to send file.")
+    } else {
+        Ok(())
+    }
+}
+
+async fn do_reply(
+    msg: &Message,
+    bot: &Bot,
+    f: InputFile,
+    action: Action,
+    caption: Option<&str>,
+) -> AnyResult<&'static str> {
+    match action {
+        Action::Raw => {
+            reply_document(msg, bot, f, caption).await?;
+        }
+        Action::Photo => {
+            let fut = reply_document(msg, bot, f.clone(), caption);
+            let (r1, r2) = join!(fut, reply_photo(msg, bot, f, caption));
+            r1?;
+            r2?;
+        }
+    }
+    Ok("")
+}
+
+fn extract_error(e: anyhow::Error) -> &'static str {
+    e.downcast::<&'static str>()
+        .unwrap_or("Something went wrong.")
 }
 
 async fn handler(msg: Message, bot: &Bot) -> &'static str {
@@ -159,38 +235,52 @@ async fn handler(msg: Message, bot: &Bot) -> &'static str {
         ch.username().unwrap_or(""),
         ch.id.0
     );
-    let mut is_video = false;
+    let mut op = Op::Image;
+    let mut caption = None;
     let (file_id, size, file_name) = if let Some(doc) = msg.document() {
         info!(
-            "downloading document {} of {} bytes",
+            "got document {} of {} bytes",
             doc.file_name.as_deref().unwrap_or(""),
             doc.file.size
         );
         if let Some(s) = &doc.file_name {
-            is_video = s.ends_with(".gif");
+            if s.ends_with(".gif") {
+                op = Op::Video;
+            }
         }
-        (&doc.file.id, doc.file.size, &doc.file_name)
+        (&doc.file.id, doc.file.size, doc.file_name.as_ref())
     } else if let Some(sizes) = msg.photo() {
         let ph = sizes
             .iter()
             .find(|ph| ph.width >= 512 || ph.height >= 512)
             .unwrap_or_else(|| sizes.last().unwrap());
         info!(
-            "downloading photo of {} {}, {} bytes",
+            "got photo of {} x {}, {} B",
             ph.width, ph.height, ph.file.size
         );
-        (&ph.file.id, ph.file.size, &None)
+        (&ph.file.id, ph.file.size, None)
     } else if let Some(ani) = msg.animation() {
         info!(
-            "downloading animation {} of {}, {}, {}, {} bytes",
+            "got animation {} of {} x {}, {} s, {} B",
             ani.file_name.as_deref().unwrap_or(""),
             ani.width,
             ani.height,
             ani.duration,
             ani.file.size
         );
-        is_video = true;
-        (&ani.file.id, ani.file.size, &ani.file_name)
+        op = Op::Video;
+        (&ani.file.id, ani.file.size, ani.file_name.as_ref())
+    } else if let Some(sti) = msg.sticker() {
+        info!(
+            "got sticker in {} of {} x {}, {} B",
+            sti.set_name.as_deref().unwrap_or(""),
+            sti.width,
+            sti.height,
+            sti.file.size
+        );
+        op = Op::Sticker(sti.format.clone());
+        caption = sti.emoji.as_ref();
+        (&sti.file.id, sti.file.size, sti.set_name.as_ref())
     } else if Some("/start") == msg.text() {
         return "Hi! Send me an image or a GIF animation, and I'll convert it for use with @Stickers.";
     } else {
@@ -202,33 +292,32 @@ async fn handler(msg: Message, bot: &Bot) -> &'static str {
         return "File is too big.";
     }
 
-    match handle_media(file_id, bot, is_video).await {
-        Ok((f, suf)) => {
+    match handle_media(file_id, bot, op).await {
+        Ok((f, suf, action)) => {
             let n = f.len();
             let f = InputFile::memory(f);
             let mut out_name;
             if let Some(s) = file_name {
-                // s.replace('.', "_")
                 out_name = s.clone();
                 out_name.push('.');
             } else {
                 out_name = "out.".to_owned();
             };
             out_name.push_str(suf);
+            info!("sending {}, {} bytes", out_name, n);
             let f = f.file_name(out_name);
-            info!("sending {} bytes", n);
-            if let Err(e) = bot.send_document(msg.chat.id, f).await {
-                error!("send_document: {:?}", e);
-                return "Failed to send file.";
+
+            let caption: Option<&str> = match caption {
+                Some(s) => Some(s),
+                None => None,
+            };
+            if let Err(e) = do_reply(&msg, bot, f, action, caption).await {
+                return extract_error(e);
             }
         }
         Err(e) => {
             error!("handle: {:?}", e);
-            return if let Ok(e) = e.downcast::<BadRequest>() {
-                e.msg
-            } else {
-                "Something went wrong."
-            };
+            return extract_error(e);
         }
     }
     ""
@@ -240,10 +329,9 @@ async fn main() {
         std::env::set_var("RUST_LOG", "info");
     }
     pretty_env_logger::init();
-    info!("starting bot...");
 
     let bot = Bot::from_env();
-    info!("bot started by {:?}", bot.client());
+    info!("bot started: {:?}", bot.client());
 
     teloxide::repl(bot, |msg: Message, bot: Bot| async move {
         tokio::spawn(async move {
@@ -256,7 +344,7 @@ async fn main() {
             }
         });
         // TODO: join the spawned tasks when interrupted?
-        respond(())
+        Ok(())
     })
     .await;
 }
