@@ -1,7 +1,4 @@
-/.idea
-/.vscode
-
+.idea
+.vscode
 /target
-
-/.env
-/*.sh
+.env
