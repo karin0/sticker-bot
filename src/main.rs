@@ -170,14 +170,10 @@ async fn ffmpeg_to_gif(data: &[u8]) -> AnyResult<Blob> {
     Ok(Blob::new(out.stdout, "gif"))
 }
 
-async fn tgs_to_gif(data: &[u8]) -> AnyResult<Blob> {
-    let (path, mut tmp) = temp_file().await?;
-    tmp.write_all(data).await?;
-    drop(tmp);
-
+async fn tgs_to_gif(file: &Path) -> AnyResult<Blob> {
     let out = wait_output(
         Command::new(TGS_TO_GIF)
-            .arg(&path)
+            .arg(file)
             .args(["--output", "-"])
             .stdout(Stdio::piped()),
     )
@@ -205,36 +201,49 @@ enum Op {
 }
 
 impl<'a> Request<'a> {
-    async fn handle_image(&self, f: TgFile) -> AnyResult<Blob> {
+    async fn download_mem(&self, f: TgFile) -> AnyResult<Vec<u8>> {
         let mut v = Vec::with_capacity(f.size as usize);
         self.bot.download_file(&f.path, &mut v).await?;
-        info!("downloaded {} bytes", v.len());
+        info!("download_mem: {} B", v.len());
+        Ok(v)
+    }
+
+    async fn download_tmp(&self, f: TgFile) -> AnyResult<TempPath> {
+        let (path, mut tmp) = temp_file().await?;
+        self.bot.download_file(&f.path, &mut tmp).await?;
+        drop(tmp);
+        info!("download_tmp: {} B", f.size);
+        Ok(path)
+    }
+
+    async fn handle_image(&self, f: TgFile) -> AnyResult<Blob> {
+        let v = self.download_mem(f).await?;
         process_image(v).await
     }
 
     async fn handle_video(&self, f: TgFile) -> AnyResult<Blob> {
-        let (path, mut tmp) = temp_file().await?;
-        self.bot.download_file(&f.path, &mut tmp).await?;
-        drop(tmp);
-        info!("downloaded {} bytes", f.size);
+        let path = self.download_tmp(f).await?;
         process_video(&path).await
     }
 
     async fn handle_sticker(&self, f: TgFile, fmt: StickerFormat) -> AnyResult<()> {
-        let mut v = Vec::with_capacity(f.size as usize);
-        self.bot.download_file(&f.path, &mut v).await?;
-        info!("downloaded {} bytes", v.len());
         match fmt {
-            StickerFormat::Raster => self.send_raw(Blob::new(v, "webp")).await,
+            StickerFormat::Raster => {
+                self.send_raw(Blob::new(self.download_mem(f).await?, "webp"))
+                    .await
+            }
+            StickerFormat::Animated => {
+                let path = self.download_tmp(f).await?;
+                self.send_raw(tgs_to_gif(&path).await?).await
+            }
             StickerFormat::Video => {
-                let data = bytes::Bytes::from(v);
+                let data = bytes::Bytes::from(self.download_mem(f).await?);
                 let (r1, r2) = join!(self.send_raw(Blob::new(data.clone(), "webm")), async move {
                     self.send_raw(ffmpeg_to_gif(&data).await?).await
                 });
                 r1?;
                 r2
             }
-            StickerFormat::Animated => self.send_raw(tgs_to_gif(&v).await?).await,
         }
     }
 
