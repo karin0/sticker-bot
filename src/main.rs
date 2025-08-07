@@ -14,7 +14,7 @@ use teloxide::errors::RequestError;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
-    File as TgFile, FileId, InputFile, MessageId, ReplyParameters, StickerFormat,
+    ChatAction, File as TgFile, FileId, InputFile, MessageId, ReplyParameters, StickerFormat,
 };
 use tempfile::{NamedTempFile, TempPath};
 use tokio::fs::File;
@@ -264,12 +264,16 @@ impl<T: Fn(MessageId)> Request<'_, T> {
             }
             StickerFormat::Animated => {
                 let path = self.download_tmp(f).await?;
-                self.send_raw(tgs_to_gif(&path).await?).await
+                let data = tgs_to_gif(&path).await?;
+                self.send_chat_action(ChatAction::UploadVideo);
+                self.send_raw(data).await
             }
             StickerFormat::Video => {
                 let data = bytes::Bytes::from(self.download_mem(f).await?);
                 let (r1, r2) = join!(self.send_raw(Blob::new(data.clone(), "webm")), async move {
-                    self.send_raw(ffmpeg_to_gif(&data).await?).await
+                    let data = ffmpeg_to_gif(&data).await?;
+                    self.send_chat_action(ChatAction::UploadVideo);
+                    self.send_raw(data).await
                 });
                 r1?;
                 r2
@@ -287,6 +291,16 @@ impl<T: Fn(MessageId)> Request<'_, T> {
             Op::Video => self.send(self.handle_video(f).await?).await,
             Op::Sticker(fmt) => self.handle_sticker(f, fmt).await,
         }
+    }
+
+    fn send_chat_action(&self, action: ChatAction) {
+        let chat_id = self.msg.chat.id;
+        let bot = self.bot.clone();
+        spawn(async move {
+            if let Err(e) = bot.send_chat_action(chat_id, action).await {
+                error!("send_chat_action: {e}");
+            }
+        });
     }
 
     fn finalize_send(&self, r: Result<Message, RequestError>) -> AnyResult<()> {
@@ -357,9 +371,13 @@ impl<T: Fn(MessageId)> Request<'_, T> {
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"))
             {
                 op = Op::Video;
+                self.send_chat_action(ChatAction::UploadDocument);
+            } else {
+                self.send_chat_action(ChatAction::UploadPhoto);
             }
             (&doc.file.id, doc.file.size, doc.file_name.as_ref())
         } else if let Some(sizes) = msg.photo() {
+            self.send_chat_action(ChatAction::UploadPhoto);
             let ph = sizes
                 .iter()
                 .find(|ph| ph.width >= 512 || ph.height >= 512)
@@ -370,6 +388,7 @@ impl<T: Fn(MessageId)> Request<'_, T> {
             );
             (&ph.file.id, ph.file.size, None)
         } else if let Some(ani) = msg.animation() {
+            self.send_chat_action(ChatAction::UploadDocument);
             info!(
                 "got animation {} of {} x {}, {} s, {} B",
                 ani.file_name.as_deref().unwrap_or(""),
@@ -381,16 +400,21 @@ impl<T: Fn(MessageId)> Request<'_, T> {
             op = Op::Video;
             (&ani.file.id, ani.file.size, ani.file_name.as_ref())
         } else if let Some(sti) = msg.sticker() {
+            let fmt = sti.format();
+            self.send_chat_action(match fmt {
+                StickerFormat::Static => ChatAction::UploadPhoto,
+                _ => ChatAction::RecordVideo,
+            });
             info!(
                 "got {:?} sticker in {} {} of {} x {}, {} B",
-                sti.format(),
+                fmt,
                 sti.set_name.as_deref().unwrap_or(""),
                 sti.emoji.as_deref().unwrap_or(""),
                 sti.width,
                 sti.height,
                 sti.file.size
             );
-            op = Op::Sticker(sti.format());
+            op = Op::Sticker(fmt);
             self.caption = sti.emoji.as_ref().map(std::convert::AsRef::as_ref);
             (&sti.file.id, sti.file.size, sti.set_name.as_ref())
         } else if Some("/start") == msg.text() {
