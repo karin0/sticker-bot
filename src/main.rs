@@ -41,7 +41,7 @@ const FFMPEG_ARGS: (&[&str], &[&str]) = (
 const FFMPEG_ARGS_WEBM_TO_GIF: (&[&str], &[&str]) =
     (&["-hide_banner", "-i"], &["-c:v", "gif", "-f", "gif", "-"]);
 
-const TGS_TO_GIF: &str = "tgs_to_gif.sh";
+const TGS_TO_GIF: &str = "lottie_to_gif.sh";
 
 #[derive(Debug, Clone)]
 struct Blob {
@@ -183,6 +183,26 @@ async fn tgs_to_gif(file: &Path) -> AnyResult<Blob> {
         bail!("tgs_to_gif")
     }
     Ok(Blob::new(out.stdout, "gif"))
+}
+
+fn check_command(bin: &str, arg: &str) -> io::Result<()> {
+    match std::process::Command::new(bin)
+        .arg(arg)
+        .stdout(Stdio::null())
+        .spawn()
+        .and_then(|mut c| c.wait())
+    {
+        Ok(r) => {
+            if !r.success() {
+                warn!("{bin} {arg} failed: {r}");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            error!("{bin} {arg}: {e}");
+            Err(e)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -376,13 +396,19 @@ impl Request<'_> {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> AnyResult<()> {
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
             std::env::set_var("RUST_LOG", "info");
         }
     }
     pretty_env_logger::init();
+
+    check_command(FFMPEG, "-version")?;
+    check_command(TGS_TO_GIF, "-v")?;
+    check_command("gifski", "-V")?;
+    check_command("gunzip", "--version")?;
+    check_command("lottie_to_png", "-v")?;
 
     let bot = Bot::from_env();
     info!("bot started: {:?}", bot.client());
@@ -407,4 +433,5 @@ async fn main() {
         Ok(())
     })
     .await;
+    Ok(())
 }
