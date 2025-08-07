@@ -30,6 +30,8 @@ $ cargo install --git https://github.com/karin0/sticker-bot
 $ TELOXIDE_TOKEN=<your_bot_token> ~/.cargo/bin/sticker-bot
 ```
 
+Alternatively, prebuilt binaries may be available from artifacts in the [Actions](https://github.com/karin0/sticker-bot/actions).
+
 ## Credits
 
 - [lottie-converter](https://github.com/ed-asriyan/lottie-converter)
