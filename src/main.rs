@@ -1,8 +1,8 @@
-use anyhow::{bail, Result as AnyResult};
+use anyhow::{Result as AnyResult, bail};
 use bytes::Bytes;
+use image::ImageReader;
 use image::imageops::FilterType;
-use image::io::Reader as ImageReader;
-use image::{GenericImageView, ImageOutputFormat};
+use image::{GenericImageView, ImageFormat};
 use log::{error, info, warn};
 use std::io;
 use std::io::Cursor;
@@ -11,7 +11,7 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{File as TgFile, InputFile, StickerFormat};
+use teloxide::types::{File as TgFile, FileId, InputFile, ReplyParameters, StickerFormat};
 use tempfile::{NamedTempFile, TempPath};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -66,9 +66,9 @@ impl Blob {
             out_name.push('.');
         } else {
             out_name = "out.".to_owned();
-        };
+        }
         out_name.push_str(self.ext);
-        info!("sending {} B as {}", n, out_name);
+        info!("sending {n} B as {out_name}");
         f.file_name(out_name)
     }
 }
@@ -90,7 +90,7 @@ async fn temp_file() -> io::Result<(TempPath, File)> {
     Ok((path, f))
 }
 
-async fn process_image(file: Vec<u8>) -> AnyResult<Blob> {
+fn process_image(file: Vec<u8>) -> AnyResult<Blob> {
     match ImageReader::new(Cursor::new(file))
         .with_guessed_format()
         .unwrap()
@@ -100,21 +100,21 @@ async fn process_image(file: Vec<u8>) -> AnyResult<Blob> {
             info!("got img of {:?}", img.dimensions());
             let img = img.resize(512, 512, FilterType::Lanczos3);
             // webp::Encoder sometimes fails with Unimplemented when inputting small images.
-            return Ok(match WebpEncoder::from_image(&img) {
+            Ok(match WebpEncoder::from_image(&img) {
                 Ok(webp) => {
                     let mem = webp.encode_lossless();
                     Blob::new(mem.to_vec(), "webp")
                 }
                 Err(e) => {
-                    warn!("webp: {}, falling back to png", e);
+                    warn!("webp: {e}, falling back to png");
                     let mut v = Cursor::new(Vec::with_capacity(60000));
-                    img.write_to(&mut v, ImageOutputFormat::Png)?;
+                    img.write_to(&mut v, ImageFormat::Png)?;
                     Blob::new(v.into_inner(), "png")
                 }
-            });
+            })
         }
         Err(e) => {
-            info!("decode failed: {}", e);
+            info!("decode failed: {e}");
             bail!("File is not an image.")
         }
     }
@@ -200,7 +200,7 @@ enum Op {
     Sticker(StickerFormat),
 }
 
-impl<'a> Request<'a> {
+impl Request<'_> {
     async fn download_mem(&self, f: TgFile) -> AnyResult<Vec<u8>> {
         let mut v = Vec::with_capacity(f.size as usize);
         self.bot.download_file(&f.path, &mut v).await?;
@@ -218,7 +218,7 @@ impl<'a> Request<'a> {
 
     async fn handle_image(&self, f: TgFile) -> AnyResult<Blob> {
         let v = self.download_mem(f).await?;
-        process_image(v).await
+        process_image(v)
     }
 
     async fn handle_video(&self, f: TgFile) -> AnyResult<Blob> {
@@ -228,7 +228,7 @@ impl<'a> Request<'a> {
 
     async fn handle_sticker(&self, f: TgFile, fmt: StickerFormat) -> AnyResult<()> {
         match fmt {
-            StickerFormat::Raster => {
+            StickerFormat::Static => {
                 self.send_raw(Blob::new(self.download_mem(f).await?, "webp"))
                     .await
             }
@@ -247,7 +247,7 @@ impl<'a> Request<'a> {
         }
     }
 
-    async fn handle_media(&self, file_id: &str, op: Op) -> AnyResult<()> {
+    async fn handle_media(&self, file_id: FileId, op: Op) -> AnyResult<()> {
         let f = self.bot.get_file(file_id).await?;
         if f.size > MAX_SIZE {
             bail!("File too big")
@@ -261,15 +261,16 @@ impl<'a> Request<'a> {
 
     async fn send_raw(&self, b: Blob) -> AnyResult<()> {
         let f = self.get_input_file(b);
-        let mut p = self.bot.send_document(self.msg.chat.id, f);
+        let mut p = self
+            .bot
+            .send_document(self.msg.chat.id, f)
+            .reply_parameters(ReplyParameters::new(self.msg.id).allow_sending_without_reply());
         if let Some(s) = self.caption {
             p.caption = Some(s.to_string());
         }
-        p.reply_to_message_id = Some(self.msg.id);
-        p.allow_sending_without_reply = Some(true);
         p.disable_content_type_detection = Some(true);
         if let Err(e) = p.await {
-            error!("send_document: {}", e);
+            error!("send_document: {e}");
             bail!("Failed to send file.")
         }
         Ok(())
@@ -277,14 +278,15 @@ impl<'a> Request<'a> {
 
     async fn send(&self, b: Blob) -> AnyResult<()> {
         let f = self.get_input_file(b);
-        let mut p = self.bot.send_document(self.msg.chat.id, f);
+        let mut p = self
+            .bot
+            .send_document(self.msg.chat.id, f)
+            .reply_parameters(ReplyParameters::new(self.msg.id).allow_sending_without_reply());
         if let Some(s) = self.caption {
             p.caption = Some(s.to_string());
         }
-        p.reply_to_message_id = Some(self.msg.id);
-        p.allow_sending_without_reply = Some(true);
         if let Err(e) = p.await {
-            error!("send_document: {}", e);
+            error!("send_document: {e}");
             bail!("Failed to send file.")
         }
         Ok(())
@@ -311,10 +313,12 @@ impl<'a> Request<'a> {
                 doc.file_name.as_deref().unwrap_or(""),
                 doc.file.size
             );
-            if let Some(s) = &doc.file_name {
-                if s.ends_with(".gif") {
-                    op = Op::Video;
-                }
+            if let Some(s) = &doc.file_name
+                && Path::new(s)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"))
+            {
+                op = Op::Video;
             }
             (&doc.file.id, doc.file.size, doc.file_name.as_ref())
         } else if let Some(sizes) = msg.photo() {
@@ -341,28 +345,28 @@ impl<'a> Request<'a> {
         } else if let Some(sti) = msg.sticker() {
             info!(
                 "got {:?} sticker in {} {} of {} x {}, {} B",
-                sti.format,
+                sti.format(),
                 sti.set_name.as_deref().unwrap_or(""),
                 sti.emoji.as_deref().unwrap_or(""),
                 sti.width,
                 sti.height,
                 sti.file.size
             );
-            op = Op::Sticker(sti.format.clone());
-            self.caption = sti.emoji.as_ref().map(|x| x.as_ref());
+            op = Op::Sticker(sti.format());
+            self.caption = sti.emoji.as_ref().map(std::convert::AsRef::as_ref);
             (&sti.file.id, sti.file.size, sti.set_name.as_ref())
         } else if Some("/start") == msg.text() {
             return "Hi! Send me an image or a GIF, and I'll convert it for use with @Stickers. Also, I can convert stickers to images or GIFs.";
         } else {
-            info!("invalid: {:#?}", msg);
+            info!("invalid: {msg:#?}");
             return "Please send an image, a GIF, or a sticker.";
         };
         if size > MAX_SIZE {
             return "File is too big.";
         }
-        self.base = file_name.map(|x| x.as_ref());
-        if let Err(e) = self.handle_media(file_id, op).await {
-            error!("handle: {:?}", e);
+        self.base = file_name.map(std::convert::AsRef::as_ref);
+        if let Err(e) = self.handle_media(file_id.clone(), op).await {
+            error!("handle: {e:?}");
             return e
                 .downcast::<&'static str>()
                 .unwrap_or("Something went wrong.");
@@ -374,7 +378,9 @@ impl<'a> Request<'a> {
 #[tokio::main]
 async fn main() {
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
+        unsafe {
+            std::env::set_var("RUST_LOG", "info");
+        }
     }
     pretty_env_logger::init();
 
@@ -391,10 +397,10 @@ async fn main() {
                 base: None,
             };
             let s = req.handler().await;
-            if !s.is_empty() {
-                if let Err(e) = bot.send_message(id, s).await {
-                    error!("send_message: {:?}", e);
-                }
+            if !s.is_empty()
+                && let Err(e) = bot.send_message(id, s).await
+            {
+                error!("send_message: {e:?}");
             }
         });
         // TODO: join the spawned tasks when interrupted?
