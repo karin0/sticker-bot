@@ -3,20 +3,25 @@ use bytes::Bytes;
 use image::ImageReader;
 use image::imageops::FilterType;
 use image::{GenericImageView, ImageFormat};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
+use std::cell::RefCell;
 use std::io;
 use std::io::Cursor;
 use std::path::Path;
 use std::process::{Output, Stdio};
 use std::time::Duration;
+use teloxide::errors::RequestError;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{File as TgFile, FileId, InputFile, ReplyParameters, StickerFormat};
+use teloxide::types::{
+    File as TgFile, FileId, InputFile, MessageId, ReplyParameters, StickerFormat,
+};
 use tempfile::{NamedTempFile, TempPath};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::join;
 use tokio::process::Command;
+use tokio::task::spawn;
 use webp::Encoder as WebpEncoder;
 
 const MAX_SIZE: u32 = 10 << 20;
@@ -206,12 +211,17 @@ fn check_command(bin: &str, arg: &str) -> io::Result<()> {
 }
 
 #[derive(Debug, Clone)]
-struct Request<'a> {
+struct Request<'a, T: Fn(MessageId)> {
     msg: Message,
     bot: Bot,
     caption: Option<&'a str>,
     base: Option<&'a str>,
+    msg_callback: T,
 }
+
+// Safety: single-threaded runtime :)
+unsafe impl<T: Fn(MessageId)> Send for Request<'_, T> {}
+unsafe impl<T: Fn(MessageId)> Sync for Request<'_, T> {}
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -220,7 +230,7 @@ enum Op {
     Sticker(StickerFormat),
 }
 
-impl Request<'_> {
+impl<T: Fn(MessageId)> Request<'_, T> {
     async fn download_mem(&self, f: TgFile) -> AnyResult<Vec<u8>> {
         let mut v = Vec::with_capacity(f.size as usize);
         self.bot.download_file(&f.path, &mut v).await?;
@@ -279,6 +289,19 @@ impl Request<'_> {
         }
     }
 
+    fn finalize_send(&self, r: Result<Message, RequestError>) -> AnyResult<()> {
+        match r {
+            Ok(msg) => {
+                (self.msg_callback)(msg.id);
+                Ok(())
+            }
+            Err(e) => {
+                error!("send: {e}");
+                bail!("Failed to send.")
+            }
+        }
+    }
+
     async fn send_raw(&self, b: Blob) -> AnyResult<()> {
         let f = self.get_input_file(b);
         let mut p = self
@@ -289,11 +312,7 @@ impl Request<'_> {
             p.caption = Some(s.to_string());
         }
         p.disable_content_type_detection = Some(true);
-        if let Err(e) = p.await {
-            error!("send_document: {e}");
-            bail!("Failed to send file.")
-        }
-        Ok(())
+        self.finalize_send(p.await)
     }
 
     async fn send(&self, b: Blob) -> AnyResult<()> {
@@ -305,26 +324,25 @@ impl Request<'_> {
         if let Some(s) = self.caption {
             p.caption = Some(s.to_string());
         }
-        if let Err(e) = p.await {
-            error!("send_document: {e}");
-            bail!("Failed to send file.")
-        }
-        Ok(())
+        self.finalize_send(p.await)
     }
 
     fn get_input_file(&self, blob: Blob) -> InputFile {
         blob.into_input_file(self.base)
     }
 
-    async fn handler(mut self) -> &'static str {
-        let ch = &self.msg.chat;
-        info!(
-            "from {} {} (@{} {})",
-            ch.first_name().unwrap_or(""),
-            ch.last_name().unwrap_or(""),
-            ch.username().unwrap_or(""),
-            ch.id.0
-        );
+    async fn handler(mut self, user_id: UserId) -> &'static str {
+        let chat = &self.msg.chat;
+        let user_id: Result<i64, _> = user_id.0.try_into();
+        if user_id != Ok(chat.id.0) {
+            info!(
+                "chat {} {} (@{} {})",
+                chat.first_name().unwrap_or(""),
+                chat.last_name().unwrap_or(""),
+                chat.username().unwrap_or(""),
+                chat.id.0
+            );
+        }
         let msg = &self.msg;
         let mut op = Op::Image;
         let (file_id, size, file_name) = if let Some(doc) = msg.document() {
@@ -376,13 +394,13 @@ impl Request<'_> {
             self.caption = sti.emoji.as_ref().map(std::convert::AsRef::as_ref);
             (&sti.file.id, sti.file.size, sti.set_name.as_ref())
         } else if Some("/start") == msg.text() {
-            return "Hi! Send me an image or a GIF, and I'll convert it for use with @Stickers. Also, I can convert stickers to images or GIFs.";
+            return "Send an image, GIF, or sticker to convert.";
         } else {
             info!("invalid: {msg:#?}");
-            return "Please send an image, a GIF, or a sticker.";
+            return "Please send an image, GIF, or sticker.";
         };
         if size > MAX_SIZE {
-            return "File is too big.";
+            return "File is too large.";
         }
         self.base = file_name.map(std::convert::AsRef::as_ref);
         if let Err(e) = self.handle_media(file_id.clone(), op).await {
@@ -395,7 +413,7 @@ impl Request<'_> {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> AnyResult<()> {
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
@@ -411,23 +429,55 @@ async fn main() -> AnyResult<()> {
     check_command("lottie_to_png", "-v")?;
 
     let bot = Bot::from_env();
-    info!("bot started: {:?}", bot.client());
+    info!("bot started: {}", bot.get_my_name().await?.name);
 
     teloxide::repl(bot, |msg: Message, bot: Bot| async move {
-        tokio::spawn(async move {
-            let id = msg.chat.id;
+        let chat_id = msg.chat.id;
+        let msg_id = msg.id;
+        let user_id = if let Some(user) = msg.from.as_ref() {
+            info!(
+                "from {} {} (@{} {})",
+                user.first_name,
+                user.last_name.as_deref().unwrap_or(""),
+                user.username.as_deref().unwrap_or(""),
+                user.id.0
+            );
+            user.id
+        } else {
+            info!("from unknown user");
+            UserId(0)
+        };
+
+        spawn(async move {
+            let resp_ids = RefCell::new(Vec::new());
+            let msg_callback = |msg_id| {
+                resp_ids.borrow_mut().push(msg_id);
+            };
+
             let req = Request {
                 msg,
                 bot: bot.clone(),
                 caption: None,
                 base: None,
+                msg_callback,
             };
-            let s = req.handler().await;
-            if !s.is_empty()
-                && let Err(e) = bot.send_message(id, s).await
-            {
-                error!("send_message: {e:?}");
+            let s = req.handler(user_id).await;
+            let mut resp_ids = resp_ids.into_inner();
+            if !s.is_empty() {
+                match bot
+                    .send_message(chat_id, s)
+                    .reply_parameters(ReplyParameters::new(msg_id))
+                    .await
+                {
+                    Ok(msg) => {
+                        resp_ids.push(msg.id);
+                    }
+                    Err(e) => {
+                        error!("send_message: {e:?}");
+                    }
+                }
             }
+            debug!("responded: {resp_ids:?}");
         });
         // TODO: join the spawned tasks when interrupted?
         Ok(())
