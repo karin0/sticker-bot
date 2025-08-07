@@ -190,7 +190,7 @@ async fn tgs_to_gif(file: &Path) -> AnyResult<Blob> {
     Ok(Blob::new(out.stdout, "gif"))
 }
 
-fn check_command(bin: &str, arg: &str) -> io::Result<()> {
+fn check_command(bin: &str, arg: &str, what_to_gif: &'static str) {
     match std::process::Command::new(bin)
         .arg(arg)
         .stdout(Stdio::null())
@@ -201,11 +201,10 @@ fn check_command(bin: &str, arg: &str) -> io::Result<()> {
             if !r.success() {
                 warn!("{bin} {arg} failed: {r}");
             }
-            Ok(())
         }
         Err(e) => {
-            error!("{bin} {arg}: {e}");
-            Err(e)
+            error!("{bin}: {e}");
+            warn!("{what_to_gif}to GIF conversions will be unavailable.");
         }
     }
 }
@@ -446,11 +445,11 @@ async fn main() -> AnyResult<()> {
     }
     pretty_env_logger::init();
 
-    check_command(FFMPEG, "-version")?;
-    check_command(TGS_TO_GIF, "-v")?;
-    check_command("gifski", "-V")?;
-    check_command("gunzip", "--version")?;
-    check_command("lottie_to_png", "-v")?;
+    check_command(FFMPEG, "-version", "WebM from/");
+    check_command(TGS_TO_GIF, "-v", "TGS ");
+    check_command("gifski", "-V", "TGS ");
+    check_command("gunzip", "--version", "TGS ");
+    check_command("lottie_to_png", "-v", "TGS ");
 
     let bot = Bot::from_env();
     info!("bot started: {}", bot.get_my_name().await?.name);

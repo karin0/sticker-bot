@@ -12,12 +12,16 @@ Demo: [@sticker_chan_bot](http://t.me/sticker_chan_bot)
 
 ## Running
 
-Prepare the following dependencies in PATH:
+Static image conversions require no external dependencies.
 
-- `ffmpeg`
-- `gifski`
-- `lottie_to_png` (Binary from [lottie-converter](https://github.com/ed-asriyan/lottie-converter/releases))
-- [`lottie_to_gif.sh`](/lottie_to_gif.sh) (A patched one in this [repository](/lottie_to_gif.sh))
+Video/animated sticker conversions involving GIFs are unavailable on Windows yet, and require the following dependencies in `PATH`:
+
+- `ffmpeg` (WebM video sticker from/to GIF)
+- `gifski` (TGS animated sticker to GIF)
+- `lottie_to_png` (TGS to GIF)
+  - Get the binary from [lottie-converter](https://github.com/ed-asriyan/lottie-converter/releases).
+- [`lottie_to_gif.sh`](/lottie_to_gif.sh) (TGS to GIF)
+  - Get the patched script [included](/lottie_to_gif.sh) in the repository.
 
 Install and run the bot using Cargo:
 
@@ -25,8 +29,6 @@ Install and run the bot using Cargo:
 $ cargo install --git https://github.com/karin0/sticker-bot
 $ TELOXIDE_TOKEN=<your_bot_token> ~/.cargo/bin/sticker-bot
 ```
-
-Windows is not supported for now.
 
 ## Credits
 
